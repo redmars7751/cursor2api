@@ -14,6 +14,7 @@ import type {
     CursorChatRequest,
     CursorMessage,
     CursorSSEEvent,
+    ParsedToolCall,
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
@@ -560,6 +561,59 @@ export function isTruncated(text: string): boolean {
     return false;
 }
 
+const LARGE_PAYLOAD_TOOL_NAMES = new Set([
+    'write',
+    'edit',
+    'multiedit',
+    'editnotebook',
+    'notebookedit',
+]);
+
+const LARGE_PAYLOAD_ARG_FIELDS = new Set([
+    'content',
+    'text',
+    'command',
+    'new_string',
+    'new_str',
+    'file_text',
+    'code',
+]);
+
+function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
+    if (LARGE_PAYLOAD_TOOL_NAMES.has(toolCall.name.toLowerCase())) {
+        return true;
+    }
+
+    for (const [key, value] of Object.entries(toolCall.arguments || {})) {
+        if (typeof value !== 'string') continue;
+        if (LARGE_PAYLOAD_ARG_FIELDS.has(key)) return true;
+        if (value.length >= 1500) return true;
+    }
+
+    return false;
+}
+
+/**
+ * 截断不等于必须续写。
+ *
+ * 对短参数工具（Read/Bash/WebSearch 等），parseToolCalls 往往能在未闭合代码块上
+ * 恢复出完整可用的工具调用；这类场景若继续隐式续写，反而会把本应立即返回的
+ * tool_use 拖成多次 240s 请求，最终让上游 agent 判定超时/terminated。
+ *
+ * 只有在以下情况才继续续写：
+ * 1. 当前仍无法恢复出任何工具调用
+ * 2. 已恢复出的工具调用明显属于大参数写入类，需要继续补全内容
+ */
+export function shouldAutoContinueTruncatedToolResponse(text: string, hasTools: boolean): boolean {
+    if (!hasTools || !isTruncated(text)) return false;
+    if (!hasToolCalls(text)) return true;
+
+    const { toolCalls } = parseToolCalls(text);
+    if (toolCalls.length === 0) return true;
+
+    return toolCalls.some(toolCallNeedsMoreContinuation);
+}
+
 // ==================== 续写去重 ====================
 
 /**
@@ -571,7 +625,7 @@ export function isTruncated(text: string): boolean {
  * 
  * 算法：从续写内容的头部取不同长度的前缀，检查是否出现在原内容的尾部
  */
-function deduplicateContinuation(existing: string, continuation: string): string {
+export function deduplicateContinuation(existing: string, continuation: string): string {
     if (!continuation || !existing) return continuation;
 
     // 对比窗口：取原内容尾部和续写头部的最大重叠检测范围
@@ -631,6 +685,134 @@ function deduplicateContinuation(existing: string, continuation: string): string
     }
 
     return continuation;
+}
+
+export async function autoContinueCursorToolResponseStream(
+    cursorReq: CursorChatRequest,
+    initialResponse: string,
+    hasTools: boolean,
+): Promise<string> {
+    let fullResponse = initialResponse;
+    const MAX_AUTO_CONTINUE = 3;
+    let continueCount = 0;
+    let consecutiveSmallAdds = 0;
+    const originalMessages = [...cursorReq.messages];
+
+    while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+
+        const anchorLength = Math.min(300, fullResponse.length);
+        const anchorText = fullResponse.slice(-anchorLength);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+        const continuationReq: CursorChatRequest = {
+            ...cursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullResponse }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
+
+        let continuationResponse = '';
+        await sendCursorRequest(continuationReq, (event: CursorSSEEvent) => {
+            if (event.type === 'text-delta' && event.delta) {
+                continuationResponse += event.delta;
+            }
+        });
+
+        if (continuationResponse.trim().length === 0) break;
+
+        const deduped = deduplicateContinuation(fullResponse, continuationResponse);
+        fullResponse += deduped;
+
+        if (deduped.trim().length === 0) break;
+        if (deduped.trim().length < 100) break;
+
+        if (deduped.trim().length < 500) {
+            consecutiveSmallAdds++;
+            if (consecutiveSmallAdds >= 2) break;
+        } else {
+            consecutiveSmallAdds = 0;
+        }
+    }
+
+    return fullResponse;
+}
+
+export async function autoContinueCursorToolResponseFull(
+    cursorReq: CursorChatRequest,
+    initialText: string,
+    hasTools: boolean,
+): Promise<string> {
+    let fullText = initialText;
+    const MAX_AUTO_CONTINUE = 3;
+    let continueCount = 0;
+    let consecutiveSmallAdds = 0;
+    const originalMessages = [...cursorReq.messages];
+
+    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+
+        const anchorLength = Math.min(300, fullText.length);
+        const anchorText = fullText.slice(-anchorLength);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+        const continuationReq: CursorChatRequest = {
+            ...cursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullText }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
+
+        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        if (continuationResponse.trim().length === 0) break;
+
+        const deduped = deduplicateContinuation(fullText, continuationResponse);
+        fullText += deduped;
+
+        if (deduped.trim().length === 0) break;
+        if (deduped.trim().length < 100) break;
+
+        if (deduped.trim().length < 500) {
+            consecutiveSmallAdds++;
+            if (consecutiveSmallAdds >= 2) break;
+        } else {
+            consecutiveSmallAdds = 0;
+        }
+    }
+
+    return fullText;
 }
 
 // ==================== 重试辅助 ====================
@@ -1104,7 +1286,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         // 保存原始请求的消息快照（不含续写追加的消息）
         const originalMessages = [...activeCursorReq.messages];
         
-        while (hasTools && isTruncated(fullResponse) && continueCount < MAX_AUTO_CONTINUE) {
+        while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
             continueCount++;
             const prevLength = fullResponse.length;
             log.warn('Handler', 'continuation', `内部检测到截断 (${fullResponse.length} chars)，隐式续写 (第${continueCount}次)`);
@@ -1186,7 +1368,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             }
         }
 
-        let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
+        let stopReason = shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) ? 'max_tokens' : 'end_turn';
         if (stopReason === 'max_tokens') {
             log.warn('Handler', 'truncation', `${MAX_AUTO_CONTINUE}次续写后仍截断 (${fullResponse.length} chars) → stop_reason=max_tokens`);
         }
@@ -1494,7 +1676,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     let consecutiveSmallAdds = 0; // 连续小增量计数
     const originalMessages = [...activeCursorReq.messages];
 
-    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
         const prevLength = fullText.length;
         log.warn('Handler', 'continuation', `非流式检测到截断 (${fullText.length} chars)，隐式续写 (第${continueCount}次)`);
@@ -1575,7 +1757,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
     }
 
     // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
-    let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
+    let stopReason = shouldAutoContinueTruncatedToolResponse(fullText, hasTools) ? 'max_tokens' : 'end_turn';
     if (stopReason === 'max_tokens') {
         log.warn('Handler', 'truncation', `非流式检测到截断响应 (${fullText.length} chars) → stop_reason=max_tokens`);
     }

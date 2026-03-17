@@ -30,6 +30,8 @@ import { getConfig } from './config.js';
 import { createRequestLogger } from './logger.js';
 import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 import {
+    autoContinueCursorToolResponseFull,
+    autoContinueCursorToolResponseStream,
     isRefusal,
     sanitizeResponse,
     isIdentityProbe,
@@ -832,6 +834,10 @@ async function handleOpenAIStream(
             await executeStream();
         }
 
+        if (hasTools) {
+            fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
+        }
+
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
         // ★ 发送 reasoning_content（如果有）
@@ -980,7 +986,8 @@ async function handleOpenAINonStream(
     body: OpenAIChatRequest,
     anthropicReq: AnthropicRequest,
 ): Promise<void> {
-    let fullText = await sendCursorRequestFull(cursorReq);
+    let activeCursorReq = cursorReq;
+    let fullText = await sendCursorRequestFull(activeCursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
     // 日志记录在详细日志中
@@ -1007,7 +1014,8 @@ async function handleOpenAINonStream(
             // 重试记录
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(retryCursorReq);
+            activeCursorReq = retryCursorReq;
+            fullText = await sendCursorRequestFull(activeCursorReq);
             // 重试响应也需要先剥离 thinking
             if (fullText.includes('<thinking>')) {
                 fullText = extractThinking(fullText).strippedText;
@@ -1026,6 +1034,10 @@ async function handleOpenAINonStream(
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
+    }
+
+    if (hasTools) {
+        fullText = await autoContinueCursorToolResponseFull(activeCursorReq, fullText, hasTools);
     }
 
     let content: string | null = fullText;
@@ -1409,6 +1421,10 @@ async function handleResponsesStream(
             }
         }
 
+        if (hasTools) {
+            fullResponse = await autoContinueCursorToolResponseStream(activeCursorReq, fullResponse, hasTools);
+        }
+
         // 清洗响应
         fullResponse = sanitizeResponse(fullResponse);
 
@@ -1573,7 +1589,8 @@ async function handleResponsesNonStream(
     body: Record<string, unknown>,
     anthropicReq: AnthropicRequest,
 ): Promise<void> {
-    let fullText = await sendCursorRequestFull(cursorReq);
+    let activeCursorReq = cursorReq;
+    let fullText = await sendCursorRequestFull(activeCursorReq);
     const hasTools = (anthropicReq.tools?.length ?? 0) > 0;
 
     // Thinking 提取
@@ -1587,7 +1604,8 @@ async function handleResponsesNonStream(
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(retryCursorReq);
+            activeCursorReq = retryCursorReq;
+            fullText = await sendCursorRequestFull(activeCursorReq);
             if (fullText.includes('<thinking>')) {
                 fullText = extractThinking(fullText).strippedText;
             }
@@ -1600,6 +1618,10 @@ async function handleResponsesNonStream(
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
+    }
+
+    if (hasTools) {
+        fullText = await autoContinueCursorToolResponseFull(activeCursorReq, fullText, hasTools);
     }
 
     fullText = sanitizeResponse(fullText);
